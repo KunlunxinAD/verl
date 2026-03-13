@@ -32,7 +32,7 @@ from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
 
-from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_xpu_available
 from verl.utils.model import check_exclude_modules, check_target_modules
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
@@ -161,7 +161,10 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
             and id(flat_param.data) != id(flat_param._local_shard)
             and flat_param.data.size() == flat_param._local_shard.size()
         )
-        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+        if is_xpu_available:
+            handle.flat_param_to(torch.device("cpu"), non_blocking=False)
+        else:
+            handle.flat_param_to(torch.device("cpu"), non_blocking=True)
         # the following still keeps id(._local_shard) != id(.data)
         flat_param._local_shard = flat_param.data
         assert id(flat_param._local_shard) != id(flat_param.data)
