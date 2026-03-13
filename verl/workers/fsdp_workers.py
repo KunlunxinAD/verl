@@ -54,7 +54,7 @@ from verl.utils.device import (
     get_device_name,
     get_nccl_backend,
     get_torch_device,
-    is_xpu_available,
+    is_kunlun_available,
     set_expandable_segments,
 )
 from verl.utils.flops_counter import FlopsCounter
@@ -796,7 +796,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            if is_xpu_available:
+            if is_kunlun_available:
                 per_tensor_param = (
                     (
                         name,

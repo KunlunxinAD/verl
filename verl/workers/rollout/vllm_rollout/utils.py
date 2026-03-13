@@ -26,7 +26,7 @@ from typing import Any, Callable, Literal, TypedDict, get_args
 import torch
 import zmq
 
-from verl.utils.device import get_torch_device, is_npu_available, is_xpu_available
+from verl.utils.device import get_torch_device, is_kunlun_available, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -63,8 +63,8 @@ def get_device_uuid(device_id: int) -> str:
             return "NPU-" + npu_visible_devices[device_id]
         else:
             return f"NPU-{device_id}"
-    elif is_xpu_available:
-        return f"XPU-{device_id}"
+    elif is_kunlun_available:
+        return f"KUNLUN-{device_id}"
     else:
         return current_platform.get_device_uuid(device_id)
 
@@ -193,7 +193,7 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc_xpu(
+    def update_weights_from_ipc_kunlun(
         self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, device_uuid: str = None
     ):
         """Update the weights of the rollout model."""

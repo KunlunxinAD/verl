@@ -8,11 +8,11 @@
 #
 # This source code is licensed under the BSD-style license in https://github.com/pytorch/torchtune/blob/main/LICENSE
 
+import glob
 import logging
 import os
 import platform
 import subprocess
-import glob
 
 import torch
 from packaging import version
@@ -20,15 +20,16 @@ from packaging import version
 logger = logging.getLogger(__name__)
 
 
-def is_torch_xpu_available() -> bool:
+def is_torch_kunlun_available() -> bool:
     try:
         xpu_files = glob.glob("/dev/xpu[0-9]*")
         if len(xpu_files) > 0:
             return True
         else:
             return False
-    except Exception as e:
+    except Exception:
         return False
+
 
 def is_torch_npu_available(check_device=True) -> bool:
     """Check if Ascend NPU is available for PyTorch operations.
@@ -56,7 +57,8 @@ def is_torch_npu_available(check_device=True) -> bool:
 
 is_cuda_available = torch.cuda.is_available()
 is_npu_available = is_torch_npu_available()
-is_xpu_available = is_torch_xpu_available()
+is_kunlun_available = is_torch_kunlun_available()
+
 
 def get_resource_name() -> str:
     """Function that return ray resource name based on the device type.
