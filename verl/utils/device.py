@@ -8,6 +8,7 @@
 #
 # This source code is licensed under the BSD-style license in https://github.com/pytorch/torchtune/blob/main/LICENSE
 
+import glob
 import logging
 import os
 import platform
@@ -17,6 +18,17 @@ import torch
 from packaging import version
 
 logger = logging.getLogger(__name__)
+
+
+def is_torch_xpu_available() -> bool:
+    try:
+        xpu_files = glob.glob("/dev/xpu[0-9]*")
+        if len(xpu_files) > 0:
+            return True
+        else:
+            return False
+    except Exception:
+        return False
 
 
 def is_torch_npu_available(check_device=True) -> bool:
@@ -45,6 +57,7 @@ def is_torch_npu_available(check_device=True) -> bool:
 
 is_cuda_available = torch.cuda.is_available()
 is_npu_available = is_torch_npu_available()
+is_xpu_available = is_torch_xpu_available()
 
 
 def get_resource_name() -> str:
@@ -75,7 +88,7 @@ def get_device_name() -> str:
     device type string. Currently supports CUDA, Ascend NPU, and CPU.
 
     Returns:
-        str: Device type string ('cuda', 'npu', or 'cpu').
+        str: Device type string ('cuda', 'npu', 'xpu', or 'cpu').
     """
     if is_cuda_available:
         device = "cuda"

@@ -26,7 +26,7 @@ from typing import Any, Callable, Literal, TypedDict, get_args
 import torch
 import zmq
 
-from verl.utils.device import get_torch_device, is_npu_available
+from verl.utils.device import get_torch_device, is_npu_available, is_xpu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -63,6 +63,8 @@ def get_device_uuid(device_id: int) -> str:
             return "NPU-" + npu_visible_devices[device_id]
         else:
             return f"NPU-{device_id}"
+    elif is_xpu_available:
+        return f"XPU-{device_id}"
     else:
         return current_platform.get_device_uuid(device_id)
 
@@ -190,6 +192,107 @@ class vLLMColocateWorkerExtension:
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+    def update_weights_from_ipc_xpu(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, device_uuid: str = None
+    ):
+        """Update the weights of the rollout model."""
+        from vllm.platforms import current_platform
+
+        if current_platform.device_type == "npu" and self.device is None:
+            self.device = torch.device(f"npu:{self.local_rank}")
+
+        # In async mode, make sure the old lora is removed before adding the new one
+        if peft_config and base_sync_done:
+            self.remove_lora(VLLM_LORA_INT_ID)
+        # build communication buffer
+        assert self.device is not None
+        if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
+            self._zmq_ctx = zmq.Context()
+        if device_uuid is not None:
+            device_uuid_parts = device_uuid.split("-")
+            num_str = device_uuid_parts[1]
+            num = int(num_str) + self.device.index
+            device_uuid = f"{device_uuid_parts[0]}-{num}"
+        self.device_uuid = device_uuid or get_device_uuid(self.device.index)
+        socket = self._zmq_ctx.socket(zmq.REP)
+        socket.connect(self._get_zmq_handle())
+
+        comm_metadata = socket.recv_pyobj()
+        buffer, shm = None, None
+        if not use_shm:
+            handle = comm_metadata
+            buffer = rebuild_ipc(handle, self.device.index)
+            assert buffer.dtype == torch.uint8
+        else:
+            shm_name = comm_metadata["name"]
+            shm_size = comm_metadata["size"]
+            buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
+        socket.send(b"")
+
+        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
+            self.model_runner.vllm_config
+        )
+
+        if self._is_qat_model:
+            # QAT: Prepare for weight loading BEFORE receiving any buckets
+            from verl.utils.qat import prepare_qat_for_load_weights
+
+            prepare_qat_for_load_weights(self.model_runner.model, device=self.device)
+            logger.info("QAT: prepare_qat_for_load_weights completed")
+        elif use_standard_weight_load:
+            # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
+            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+        # receive bucket and update weights
+        while True:
+            metadata = socket.recv_pyobj()
+            weights, tensor = [], None
+            for name, meta in metadata["bucket_meta"].items():
+                shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
+                size = dtype.itemsize * shape.numel()
+                # NOTE: we need to clone the tensor to release CUDA IPC memory
+                # but for shared memory, it's not necessary and if we do clone,
+                # it will cause extra memory copy overhead and slow down the process.
+                tensor = buffer[offset : offset + size].view(dtype=dtype).view(shape)
+
+                if not use_shm:
+                    tensor = tensor.to("cpu")
+                    tensor = tensor.clone()
+                else:
+                    tensor = tensor.to(self.device)
+                weights.append((name, tensor))
+            get_torch_device().synchronize()
+            socket.send(b"")
+            self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            del weights, tensor
+            if metadata["is_last"]:
+                break
+
+        if self._is_qat_model:
+            # QAT: call process_weights_after_loading AFTER all buckets are received
+            from verl.utils.qat import manual_process_weights_after_loading
+
+            manual_process_weights_after_loading(self.model_runner.model)
+            logger.info("QAT: process_weights_after_loading completed")
+        elif use_standard_weight_load:
+            # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+            model = self.model_runner.model
+            model_config = self.model_runner.vllm_config.model_config
+            process_weights_after_loading(model, model_config, self.device)
+
+        # clean up
+        socket.close()
+        del buffer
+        if shm is not None:
+            shm.close()
+            del shm
+        get_torch_device().synchronize()
+        gc.collect()
+        get_torch_device().ipc_collect()
+        get_torch_device().empty_cache()
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""

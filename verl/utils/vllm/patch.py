@@ -14,6 +14,8 @@
 
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
+from verl.utils.device import is_xpu_available
+
 SUPPORTED_MOE_MODELS = []
 
 try:
@@ -52,12 +54,13 @@ try:
 except ImportError:
     pass
 
-try:
-    from vllm.model_executor.models.qwen3_next import Qwen3NextForCausalLM
+if not is_xpu_available:
+    try:
+        from vllm.model_executor.models.qwen3_next import Qwen3NextForCausalLM
 
-    SUPPORTED_MOE_MODELS.append(Qwen3NextForCausalLM)
-except ImportError:
-    pass
+        SUPPORTED_MOE_MODELS.append(Qwen3NextForCausalLM)
+    except ImportError:
+        pass
 
 try:
     from vllm.model_executor.models.kimi_vl import KimiVLForConditionalGeneration
