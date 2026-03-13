@@ -14,7 +14,8 @@
 
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
-from verl.utils.device import is_xpu_available 
+from verl.utils.device import is_xpu_available
+
 SUPPORTED_MOE_MODELS = []
 
 try:
