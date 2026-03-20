@@ -54,6 +54,7 @@ from verl.utils.device import (
     get_device_name,
     get_nccl_backend,
     get_torch_device,
+    is_kunlun_available,
     set_expandable_segments,
 )
 from verl.utils.flops_counter import FlopsCounter
@@ -805,10 +806,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
-            )
+            if is_kunlun_available:
+                per_tensor_param = (
+                    (
+                        name,
+                        param.to(device, dtype=torch.float16, non_blocking=True).full_tensor()
+                        if isinstance(param, DTensor)
+                        else param,
+                    )
+                    for name, param in params.items()
+                )
+            else:
+                per_tensor_param = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in params.items()
+                )
 
         # QAT: quantize weights before sending to vLLM
         if self._qat_enabled:

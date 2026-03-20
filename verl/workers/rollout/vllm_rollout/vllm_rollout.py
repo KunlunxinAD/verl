@@ -38,7 +38,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
-from verl.utils.device import get_device_id, is_support_ipc
+from verl.utils.device import get_device_id, is_kunlun_available, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
@@ -156,12 +156,18 @@ class ServerAdapter(BaseRollout):
     ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
         start_time = time.time()
-
-        future = await self._execute_method(
-            "update_weights_from_ipc",
-            non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
-        )
+        if is_kunlun_available:
+            future = await self._execute_method(
+                "update_weights_from_ipc_kunlun",
+                non_block=True,
+                kwargs={**kwargs, "use_shm": self.use_shm, "device_uuid": self.device_uuid},
+            )
+        else:
+            future = await self._execute_method(
+                "update_weights_from_ipc",
+                non_block=True,
+                kwargs={**kwargs, "use_shm": self.use_shm},
+            )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(

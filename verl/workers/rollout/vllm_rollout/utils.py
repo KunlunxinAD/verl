@@ -23,7 +23,7 @@ from typing import Any, Literal, get_args
 
 import torch
 
-from verl.utils.device import is_npu_available
+from verl.utils.device import is_kunlun_available, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -60,6 +60,8 @@ def get_device_uuid(device_id: int) -> str:
             return "NPU-" + npu_visible_devices[device_id]
         else:
             return f"NPU-{device_id}"
+    elif is_kunlun_available:
+        return f"KUNLUN-{device_id}"
     else:
         return current_platform.get_device_uuid(device_id)
 
@@ -151,6 +153,68 @@ class vLLMColocateWorkerExtension:
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+    def update_weights_from_ipc_kunlun(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, device_uuid: str = None
+    ):
+        """Update the weights of the rollout model."""
+        from vllm.platforms import current_platform
+
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+        if current_platform.device_type == "npu" and self.device is None:
+            self.device = torch.device(f"npu:{self.local_rank}")
+
+        if device_uuid is not None:
+            device_uuid_parts = device_uuid.split("-")
+            num_str = device_uuid_parts[1]
+            num = int(num_str) + self.device.index
+            device_uuid = f"{device_uuid_parts[0]}-{num}"
+        self.device_uuid = device_uuid or get_device_uuid(self.device.index)
+
+        # In async mode, make sure the old lora is removed before adding the new one
+        if peft_config and base_sync_done:
+            self.remove_lora(VLLM_LORA_INT_ID)
+
+        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
+            self.model_runner.vllm_config
+        )
+
+        if self._is_qat_model:
+            # QAT: Prepare for weight loading BEFORE receiving any buckets
+            from verl.utils.qat import prepare_qat_for_load_weights
+
+            prepare_qat_for_load_weights(self.model_runner.model, device=self.device)
+            logger.info("QAT: prepare_qat_for_load_weights completed")
+        elif use_standard_weight_load:
+            # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
+            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+        assert self.device is not None
+        receiver = BucketedWeightReceiver(
+            zmq_handle=self._get_zmq_handle(),
+            device=self.device,
+            use_shm=use_shm,
+        )
+        receiver.receive_weights(
+            on_bucket_received=lambda weights: self._update_weights(
+                weights, peft_config=peft_config, base_sync_done=base_sync_done
+            )
+        )
+
+        if self._is_qat_model:
+            # QAT: call process_weights_after_loading AFTER all buckets are received
+            from verl.utils.qat import manual_process_weights_after_loading
+
+            manual_process_weights_after_loading(self.model_runner.model)
+            logger.info("QAT: process_weights_after_loading completed")
+        elif use_standard_weight_load:
+            # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+            model = self.model_runner.model
+            model_config = self.model_runner.vllm_config.model_config
+            process_weights_after_loading(model, model_config, self.device)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
