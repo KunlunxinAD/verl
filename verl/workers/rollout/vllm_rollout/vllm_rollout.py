@@ -41,7 +41,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
-from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_support_ipc
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_kunlun_available, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.utils import ensure_async_iterator
@@ -154,12 +154,18 @@ class ServerAdapter(BaseRollout):
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
         start_time = time.time()
-
-        future = await self._execute_method(
-            "update_weights_from_ipc",
-            non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
-        )
+        if is_kunlun_available:
+            future = await self._execute_method(
+                "update_weights_from_ipc_kunlun",
+                non_block=True,
+                kwargs={**kwargs, "use_shm": self.use_shm, "device_uuid": self.device_uuid},
+            )
+        else:
+            future = await self._execute_method(
+                "update_weights_from_ipc",
+                non_block=True,
+                kwargs={**kwargs, "use_shm": self.use_shm},
+            )
 
         # build communication buffer
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
