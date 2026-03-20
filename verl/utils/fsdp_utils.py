@@ -49,6 +49,10 @@ elif version.parse(torch.__version__) >= version.parse("2.4"):
 else:
     fully_shard, MixedPrecisionPolicy, FSDPModule, CPUOffloadPolicy, fully_shard_module = None, None, None, None, None
 
+if is_kunlun_available:
+    from torch.distributed.tensor import DTensor, Shard
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+
 
 def init_fn(x: torch.nn.Module):
     if torch.distributed.get_rank() != 0:
