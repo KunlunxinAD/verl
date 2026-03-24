@@ -1,0 +1,18 @@
+# Pull base image
+FROM iregistry.baidu-int.com/xpu/xverl_torch251_ubuntu2204_xvllm011_dev:20260106_3
+
+WORKDIR /workspace
+
+RUN wget https://su.bcebos.com/v1/klx-sdk-release-public/xav/xav_verl/torch25/vllm-std.tar.gz && \
+    tar -zxvf vllm-std.tar.gz && \
+    rm vllm-std.tar.gz
+
+RUN git clone https://github.com/KunlunxinAD/verl.git
+
+ENV PATH /root/miniconda/envs/python310_torch25_cuda/bin:$PATH
+
+RUN cd verl && git checkout klx_v0.8.0_torch2.5 && pip install -e . && pip install -U ray 
+
+RUN rm -rf xverl
+# Setting Default Commands
+CMD ["/bin/bash"]
