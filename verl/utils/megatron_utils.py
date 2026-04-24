@@ -39,7 +39,7 @@ from megatron.core.utils import get_attr_wrapped_model
 from transformers import PretrainedConfig
 
 import verl.utils.megatron.tensor_parallel as tp_utils
-from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_kunlun_available
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
@@ -450,9 +450,14 @@ def offload_megatron_model_to_cpu(models):
         else:
             # we need this for ref module
             for _, param in model_chunk.named_parameters():
-                param.data = param.data.to("cpu", non_blocking=True)
-                if param.grad is not None:
-                    param.grad = param.grad.to("cpu", non_blocking=True)
+                if is_kunlun_available:
+                    param.data = param.data.to("cpu", non_blocking=False)
+                    if param.grad is not None:
+                        param.grad = param.grad.to("cpu", non_blocking=False)
+                else:
+                    param.data = param.data.to("cpu", non_blocking=True)
+                    if param.grad is not None:
+                        param.grad = param.grad.to("cpu", non_blocking=True)
     gc.collect()
     get_torch_device().empty_cache()
 
@@ -486,7 +491,10 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
                         # copy data from cpu to cuda
-                        buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
+                        if is_kunlun_available:
+                            buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=False)
+                        else:
+                            buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
 
             # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
             if load_frozen_params:
@@ -523,7 +531,10 @@ def offload_megatron_copy_params(optimizers):
     def offload_tensor_to_cpu(tensor):
         if tensor is None:
             return
-        tensor.data = tensor.data.to("cpu", non_blocking=True)
+        if is_kunlun_available:
+            tensor.data = tensor.data.to("cpu", non_blocking=False)
+        else:
+            tensor.data = tensor.data.to("cpu", non_blocking=True)
 
     def offload_group_to_cpu(group):
         if group is None:
