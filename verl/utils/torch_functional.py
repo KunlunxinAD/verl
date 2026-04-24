@@ -45,6 +45,8 @@ try:
 except ImportError:
     NPU_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
+from verl.utils.device import is_kunlun_available
+
 
 def gather_from_labels(data: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
     """Gather values from data tensor at positions specified by label indices.
@@ -280,7 +282,10 @@ def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, 
     """
     # If NaNs exist out of mask, replace NaNs in values with a value that
     # won't affect the sum (e.g., 0 for masked regions)
-    valid_values = torch.where(mask.bool(), values, 0.0)
+    if is_kunlun_available:
+        valid_values = torch.where(mask.bool(), values, torch.zeros_like(values))
+    else:
+        valid_values = torch.where(mask.bool(), values, 0.0)
     return (valid_values * mask).sum(axis=axis)
 
 

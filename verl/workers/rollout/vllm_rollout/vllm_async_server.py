@@ -32,27 +32,18 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-
-# _VLLM_VERSION = version.parse(vllm.__version__)
-# if _VLLM_VERSION > version.parse("0.11.0"):
-#     from vllm.utils.argparse_utils import FlexibleArgumentParser
-#     if _VLLM_VERSION == version.parse("0.12.0"):
-#         from vllm.entrypoints.harmony_utils import get_encoding
-#     elif _VLLM_VERSION >= version.parse("0.13.0"):
-#         from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-#     else:
-#         get_encoding = None
-#     if get_encoding is not None and os.getenv("VERL_USE_GPT_OSS", "0") == "1":
-#         get_encoding()
-# else:
-#     from vllm.utils import FlexibleArgumentParser
-from vllm.utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_npu_available, is_torch_npu_available
+from verl.utils.device import (
+    get_resource_name,
+    get_visible_devices_keyword,
+    is_kunlun_available,
+    is_npu_available,
+    is_torch_npu_available,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
-from verl.utils.profiler import DistProfiler
+from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -67,8 +58,21 @@ from verl.workers.rollout.vllm_rollout.utils import (
     get_vllm_max_lora_rank,
 )
 
-_VLLM_VERSION = version.parse("0.11.0")
+_VLLM_VERSION = version.parse("0.13.0")
+# _VLLM_VERSION = version.parse(vllm.__version__)
+if _VLLM_VERSION > version.parse("0.11.0"):
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+    if _VLLM_VERSION == version.parse("0.12.0"):
+        from vllm.entrypoints.harmony_utils import get_encoding
+    elif _VLLM_VERSION >= version.parse("0.13.0"):
+        from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+    else:
+        get_encoding = None
+    if get_encoding is not None and os.getenv("VERL_USE_GPT_OSS", "0") == "1":
+        get_encoding()
+else:
+    from vllm.utils import FlexibleArgumentParser
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -327,13 +331,13 @@ class vLLMHttpServer:
             **engine_kwargs,
         }
 
-        # # update profiler args
-        # profiler_args = build_vllm_profiler_args(
-        #     self.profiler_controller.config, self.profiler_controller.tool_config, self.replica_rank
-        # )
-        # if _VLLM_VERSION >= version.parse("0.13.0"):
-        #     # vLLM >= 0.13.0 supports profiler config via CLI args; env vars still work but will be deprecated
-        #     args.update(profiler_args)
+        # update profiler args
+        profiler_args = build_vllm_profiler_args(
+            self.profiler_controller.config, self.profiler_controller.tool_config, self.replica_rank
+        )
+        if _VLLM_VERSION >= version.parse("0.13.0"):
+            # vLLM >= 0.13.0 supports profiler config via CLI args; env vars still work but will be deprecated
+            args.update(profiler_args)
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -633,7 +637,7 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.HYBRID:
             # Don't use engine.sleep(level=2) here
             # lora only update adapter weights, so set sleep level to 1
-            if self.lora_as_adapter or is_npu_available:
+            if self.lora_as_adapter or is_npu_available or is_kunlun_available:
                 sleep_level = 1
             else:
                 sleep_level = 2
