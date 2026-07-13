@@ -1132,7 +1132,12 @@ class vLLMHttpServer:
         # to be restored by actor weight sync after level 2 sleep discards them.
         # lora only update adapter weights, so set sleep level to 1
         # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False) or is_kunlun_available:
+        if (
+            mtp_rollout_enabled
+            or self.lora_as_adapter
+            or is_torch_npu_available(check_device=False)
+            or is_kunlun_available
+        ):
             sleep_level = 1
         else:
             sleep_level = 2

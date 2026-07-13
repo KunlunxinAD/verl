@@ -8,7 +8,6 @@
 #
 # This source code is licensed under the BSD-style license in https://github.com/pytorch/torchtune/blob/main/LICENSE
 
-import glob
 """Backward-compatible device utilities.
 
 All public names in this module are preserved for existing callers (80+ import
@@ -16,6 +15,7 @@ sites).  Internally every function now delegates to the platform abstraction
 layer in :mod:`verl.plugin.platform`.
 """
 
+import glob
 import logging
 import os
 import platform
@@ -38,6 +38,8 @@ def is_torch_kunlun_available() -> bool:
             return False
     except Exception:
         return False
+
+
 # ---------------------------------------------------------------------------
 # Module-level availability flags (kept for backward compatibility)
 # ---------------------------------------------------------------------------
