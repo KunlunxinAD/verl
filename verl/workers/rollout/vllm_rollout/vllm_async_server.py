@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import uuid
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,7 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
+from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_resource_name,
@@ -54,12 +56,18 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_PATH,
     SuppressSignalInThread,
     build_cli_args_from_config,
+    build_mtp_speculative_config,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
 
 _VLLM_VERSION = version.parse("0.13.0")
 # _VLLM_VERSION = version.parse(vllm.__version__)
+_RESET_PREFIX_CACHE_KWARGS = {}
+if _VLLM_VERSION >= version.parse("0.13.0"):
+    _RESET_PREFIX_CACHE_KWARGS["reset_connector"] = True
+
+
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -96,6 +104,8 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        disaggregation_role: str = "null",
+        disaggregation_kv_transfer_config: Optional[dict] = None,
     ):
         """
         Args:
@@ -107,13 +117,45 @@ class vLLMHttpServer:
             gpus_per_node (int): number of gpus per node.
             nnodes (int): number of nodes.
             cuda_visible_devices (str): cuda visible devices.
+            disaggregation_role: PD role, or ``"null"`` for normal rollout.
+            disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
         """
+        if disaggregation_role not in ("null", "prefill", "decode"):
+            raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
+        if disaggregation_role != "null" and disaggregation_kv_transfer_config is None:
+            raise ValueError(
+                f"disaggregation_role={disaggregation_role!r} requires disaggregation_kv_transfer_config to be set"
+            )
+        self._disaggregation_role = disaggregation_role
+        self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
+        # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
+        self._pd_decode_peers: list[ActorHandle] = []
+        self._pd_prefill_side_channel_port: Optional[int] = None
+        self._pd_prefill_engine_id: Optional[str] = None
+        self._pd_peer_idx: int = 0
+
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        # Forward the Ray job id into the vLLM worker subprocess so the
+        # colocated weight-transfer IPC socket path is unique per Ray job.
+        # Without this, two concurrent verl jobs on the same node both bind
+        # the same /tmp/rl-colocate-zmq-replica-0-rank-0.sock and one fails
+        # with EADDRINUSE; a stale socket from a crashed run trips the same
+        # error on restart.
+        os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
         self._validate_configs()
+
+        if self.config.full_determinism:
+            from verl.workers.engine.utils import enable_full_determinism
+
+            rollout_seed = replica_rank + self.config.seed
+            enable_full_determinism(seed=rollout_seed)
+            os.environ["VERL_FULL_DETERMINISM"] = "1"
+            os.environ["VERL_SEED"] = str(rollout_seed)
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -124,6 +166,7 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._warned_missing_spec_decode_stats = False
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -192,6 +235,20 @@ class vLLMHttpServer:
             kwargs=kwargs,
         )
 
+    async def set_pd_peer(
+        self,
+        decode_peers: list,
+        prefill_side_channel_port: int,
+        prefill_engine_id: str,
+    ) -> None:
+        assert self._disaggregation_role == "prefill", (
+            f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
+        )
+        assert isinstance(decode_peers, list) and decode_peers, "decode_peers must be a non-empty list"
+        self._pd_decode_peers = list(decode_peers)
+        self._pd_prefill_side_channel_port = prefill_side_channel_port
+        self._pd_prefill_engine_id = prefill_engine_id
+
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
@@ -206,7 +263,7 @@ class vLLMHttpServer:
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
-        if self.config.cudagraph_capture_sizes:
+        if self.config.cudagraph_capture_sizes and _VLLM_VERSION <= version.parse("0.11.0"):
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
@@ -238,6 +295,8 @@ class vLLMHttpServer:
                 dcp_size,
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
+        if self.config.cudagraph_capture_sizes and _VLLM_VERSION > version.parse("0.11.0"):
+            compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
         args = {
@@ -258,7 +317,7 @@ class vLLMHttpServer:
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
-            "seed": self.replica_rank + self.config.get("seed", 0),
+            "seed": self.replica_rank + self.config.seed,
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
             "hf_overrides": hf_overrides,
@@ -284,13 +343,12 @@ class vLLMHttpServer:
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp (None for diffusion models; only LLM models use speculative decoding)
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            speculative_config = {
-                "method": self.config.mtp.method,
-                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
-            }
-            args["speculative_config"] = speculative_config
+            args["speculative_config"] = build_mtp_speculative_config(
+                self.config.mtp.method,
+                self.config.mtp.num_speculative_tokens,
+                args.get("speculative_config"),
+            )
 
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
@@ -346,7 +404,23 @@ class vLLMHttpServer:
             args.update(lora_args)
 
         if self.config.enable_rollout_routing_replay:
+            # R3 (Rollout Router Replay) relies on vLLM's ``enable_return_routed_experts``
+            # path (RoutedExpertsManager / RoutedExpertsCapturer), which is only correct
+            # for hybrid-attention MoE models (e.g. Qwen3.5, whose linear + full attention
+            # layout produces >1 KV-cache group) starting from vLLM 0.22.0. Earlier
+            # releases either lack the feature or under-size the routed-experts host
+            # buffer and crash with an IndexError. Fail fast with an actionable message
+            # instead of surfacing an opaque runtime error deep inside vLLM.
+            if _VLLM_VERSION < version.parse("0.22.0"):
+                raise RuntimeError(
+                    "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
+                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
+                    "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
+                )
             args.update({"enable_return_routed_experts": True})
+
+        if self._disaggregation_role != "null":
+            args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -396,11 +470,17 @@ class vLLMHttpServer:
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
+        build_app_kwargs: dict[str, Any] = {}
         if "supported_tasks" in build_app_sig.parameters:
             supported_tasks = await engine_client.get_supported_tasks()
-            app = build_app(args, supported_tasks)
-        else:
-            app = build_app(args)
+            build_app_kwargs["supported_tasks"] = supported_tasks
+        # vLLM >= 0.20.0 requires `model_config` to register pooling API routes
+        # (e.g. ``/classify``, ``/embed``); see
+        # ``register_pooling_api_routers`` in vllm/entrypoints/pooling/factories.py
+        # which short-circuits when ``model_config`` is ``None``.
+        if "model_config" in build_app_sig.parameters:
+            build_app_kwargs["model_config"] = engine_client.model_config
+        app = build_app(args, **build_app_kwargs)
 
         init_app_sig = inspect.signature(init_app_state)
         if "vllm_config" in init_app_sig.parameters:
@@ -445,18 +525,40 @@ class vLLMHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
+        kv_transfer_params: Optional[dict] = None,
     ) -> TokenOutput:
-        """Generate sequence with token-in-token-out."""
+        """Generate sequence with token-in-token-out.
+
+        Args:
+            kv_transfer_params: vLLM KV-transfer payload for PD requests.
+        """
+        if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+            return await self._pd_dispatch(
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
-        # This serves as a safety upper bound
+        # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
+        # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
+        # least one token of headroom to be able to generate at all.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 0:
+        if max_possible_tokens < 1:
             raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
+                f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
+                f"model's maximum context length ({self.config.max_model_len}); need at least "
+                f"1 token of headroom."
             )
 
         # Determine max_tokens from sampling_params or use configured response_length as default
@@ -473,14 +575,25 @@ class vLLMHttpServer:
                 self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
             )
 
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        # Clamp max_tokens to the valid range [1, max_possible_tokens]. The lower bound
+        # is 1 because vLLM v0.20+ raises VLLMValidationError when max_tokens < 1.
+        max_tokens = max(1, min(max_tokens, max_possible_tokens))
 
-        assert max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
+        assert 1 <= max_tokens <= max_possible_tokens, (
+            f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        # Inject per-request seed for deterministic sampling when full_determinism is enabled.
+        if self.config.full_determinism:
+            sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
+
+        if kv_transfer_params is not None:
+            extra_args = dict(sampling_params.pop("extra_args", None) or {})
+            extra_args["kv_transfer_params"] = kv_transfer_params
+            sampling_params["extra_args"] = extra_args
+
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -488,8 +601,16 @@ class vLLMHttpServer:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        try:
+            prompt = TokensPrompt(**prompt_kwargs)
+        except TypeError:
+            prompt = prompt_kwargs
 
         # Add lora request
         lora_request = None
@@ -516,6 +637,18 @@ class vLLMHttpServer:
         assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
+        # Handle abort case: when the request is aborted by pause_generation(abort),
+        # outputs may be empty. Return empty results with stop_reason="aborted"
+        # instead of crashing with "IndexError: list index out of range".
+        if not final_res.outputs:
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+                extra_fields=extra_fields,
+            )
+
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
@@ -544,6 +677,24 @@ class vLLMHttpServer:
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
 
+        response_kv_transfer_params = getattr(final_res, "kv_transfer_params", None)
+        if response_kv_transfer_params is not None:
+            extra_fields["kv_transfer_params"] = response_kv_transfer_params
+
+        # Re-key backend spec-decoding stats to the rollout-common names.
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+            spec_decode_stats = getattr(final_res.metrics, "request_spec_decode_stats", None)
+            if spec_decode_stats is None:
+                if not self._warned_missing_spec_decode_stats:
+                    logger.warning(
+                        "vLLM MTP rollout metrics do not include request_spec_decode_stats; "
+                        "speculative decoding acceptance metrics will be skipped."
+                    )
+                    self._warned_missing_spec_decode_stats = True
+            else:
+                extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
+                extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
+                extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
@@ -553,17 +704,96 @@ class vLLMHttpServer:
             extra_fields=extra_fields,
         )
 
-    async def wake_up(self):
+    def _select_decode_peer(self) -> ActorHandle:
+        """Round-robin across decode peers."""
+        peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]
+        self._pd_peer_idx += 1
+        return peer
+
+    async def _pd_dispatch(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        priority: int = 0,
+    ) -> TokenOutput:
+        """Run prefill locally, then decode on a selected peer."""
+        decode_peer = self._select_decode_peer()
+        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
+        is_mooncake = connector == "MooncakeConnector"
+
+        # Prefill only materializes KV; discard its single generated token.
+        prefill_sp = dict(sampling_params)
+        prefill_sp.pop("max_tokens", None)
+        prefill_sp.pop("max_new_tokens", None)
+        prefill_sp["max_tokens"] = 1
+        transfer_id = uuid.uuid4().hex
+        prefill_kv_params = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "transfer_id": transfer_id,
+        }
+
+        prefill_out = await self.generate(
+            prompt_ids,
+            prefill_sp,
+            f"{request_id}_P",
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            priority=priority,
+            kv_transfer_params=prefill_kv_params,
+        )
+        if is_mooncake:
+            # Mooncake does not return decode params from the prefill leg.
+            decode_kv_params = {
+                "do_remote_decode": False,
+                "do_remote_prefill": True,
+                "remote_engine_id": self._pd_prefill_engine_id,
+                # Single-node PD uses Mooncake's local bootstrap address.
+                "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
+                "transfer_id": transfer_id,
+            }
+        else:
+            decode_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
+            if decode_kv_params is None:
+                raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
+
+        return await decode_peer.generate.remote(
+            prompt_ids,
+            dict(sampling_params),
+            f"{request_id}_D",
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            priority=priority,
+            kv_transfer_params=decode_kv_params,
+        )
+
+    async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
+            # processes across all DP shards (unlike collective_rpc which only reaches
+            # TP workers within a single shard).
+            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
-            await self.engine.reset_prefix_cache()
+            # reset_connector=True drops any attached external KV store
+            # (e.g. MooncakeStoreConnector) whose entries were computed
+            # against the previous weights. No-op success when no connector
+            # is configured (vLLM scheduler treats it as such).
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -578,7 +808,34 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def clear_kv_cache(self):
+        if self.node_rank == 0:
+            # reset_connector=True drops any attached external KV store
+            # (e.g. MooncakeStoreConnector) whose entries were computed
+            # against the previous model weights. With no connector it
+            # is a no-op success, so we can pass it unconditionally.
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+
+            if _VLLM_VERSION >= version.parse("0.9.0"):
+                await self.engine.reset_mm_cache()
+            if _VLLM_VERSION >= version.parse("0.16.0"):
+                await self.engine.reset_encoder_cache()
+
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+        # TODO: support true release of kv_cache
+        """
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
+        if self.node_rank != 0:
+            return
+
     async def start_profile(self, **kwargs):
+        if self.node_rank != 0:
+            return
         if (
             self.profiler_controller.check_enable()
             and self.profiler_controller.check_this_rank()
@@ -587,16 +844,14 @@ class vLLMHttpServer:
             await self.engine.start_profile(**kwargs)
 
     async def stop_profile(self):
+        if self.node_rank != 0:
+            return
         if (
             self.profiler_controller.check_enable()
             and self.profiler_controller.check_this_rank()
             and self.profiler_controller.is_discrete_mode()
         ):
             await self.engine.stop_profile()
-
-    async def clear_kv_cache(self):
-        if self.node_rank == 0:
-            await self.engine.reset_prefix_cache()
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
@@ -629,7 +884,12 @@ class vLLMHttpServer:
                 # 1. Set engine to paused state (blocks new generate calls)
                 # 2. Abort all in-flight requests
                 # 3. Wait for requests to drain
-                # 4. Clear prefix and mm caches if clear_cache=True
+                # 4. Clear prefix and mm caches if clear_cache=True.
+                #    EngineCore._reset_caches defaults reset_connector=True
+                #    on this path, so any attached external KV store (e.g.
+                #    MooncakeStoreConnector) is invalidated along with the
+                #    local prefix cache — RL-correct hard-reset at every
+                #    weight update boundary, no extra kwargs needed.
                 await self.engine.pause_generation(
                     wait_for_inflight_requests=False,
                     clear_cache=reset_prefix_cache,
@@ -854,15 +1114,29 @@ class vLLMHttpServer:
         return ["kv_cache", "weights"]
 
     async def _sleep_hybrid(self):
-        """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
-        # Don't use engine.sleep(level=2) here
+        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
+
+        Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
+        that sleep is properly propagated to all data-parallel worker processes.
+        collective_rpc only reaches the TP workers within a single DP shard,
+        leaving other DP shards' weights unreleased, which causes OOM during
+        FSDP training backward when DP > 1.
+        """
+        mtp_config = getattr(self.config, "mtp", None)
+        mtp_rollout_enabled = (
+            mtp_config is not None
+            and getattr(mtp_config, "enable", False)
+            and getattr(mtp_config, "enable_rollout", False)
+        )
+        # MTP drafter-only weights are initialized by vLLM and are not guaranteed
+        # to be restored by actor weight sync after level 2 sleep discards them.
         # lora only update adapter weights, so set sleep level to 1
         # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
-        if self.lora_as_adapter or is_torch_npu_available(check_device=False) or is_kunlun_available:
+        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False) or is_kunlun_available:
             sleep_level = 1
         else:
             sleep_level = 2
-        await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
+        await self.engine.sleep(level=sleep_level)
         if _VLLM_VERSION >= version.parse("0.17.0"):
             await self.engine.reset_encoder_cache()
 
@@ -921,22 +1195,17 @@ class vLLMReplica(RolloutReplica):
                 name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
             else:
                 name = f"{prefix}server_{self.replica_rank}_{node_rank}{self.name_suffix}"
+            env_vars = {
+                **{var: "1" for var in get_platform().ray_noset_envvars()},
+                **get_platform().rollout_env_vars(),
+            }
+
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={
-                    "env_vars": {
-                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                        # To prevent hanging or crash during synchronization of weights between actor and rollout
-                        # in disaggregated mode. See:
-                        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-                        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
-                        "NCCL_CUMEM_ENABLE": "0",
-                    }
-                },
+                runtime_env={"env_vars": env_vars},
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(
@@ -1019,6 +1288,12 @@ class vLLMReplica(RolloutReplica):
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
+    async def release_kv_cache(self):
+        # Drain all in-flight requests so that vLLM worker threads go idle
+        # before we touch engine.release_kv_cache()
+        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
     # -----------------------------------------------------------------------
@@ -1033,5 +1308,5 @@ class vLLMReplica(RolloutReplica):
             )
 
     def _get_server_name_prefix(self) -> str:
-        """Return the Ray actor name prefix (e.g. 'vllm_' or 'vllm_omni_')."""
+        """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"

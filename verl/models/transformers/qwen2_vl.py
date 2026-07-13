@@ -508,6 +508,7 @@ def forward_with_torch_backend(
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
+    shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -515,8 +516,11 @@ def forward_with_torch_backend(
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
     hidden_states = outputs[0]
 
-    # Loss calculations
-    if labels is not None:
+    # Loss calculations. See `dense_common.forward_with_torch_backend` for the
+    # `shift_labels` rationale (issue #6068).
+    if shift_labels is not None:
+        rolled_labels = shift_labels
+    elif labels is not None:
         rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
     elif input_ids is not None:
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
@@ -542,6 +546,7 @@ def forward_with_triton_backend(
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
+    shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -549,8 +554,11 @@ def forward_with_triton_backend(
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
     hidden_states = outputs[0]
 
-    # Loss calculations
-    if labels is not None:
+    # See `dense_common.forward_with_torch_backend` for the `shift_labels`
+    # rationale (issue #6068).
+    if shift_labels is not None:
+        rolled_labels = shift_labels
+    elif labels is not None:
         rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
     elif input_ids is not None:
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
